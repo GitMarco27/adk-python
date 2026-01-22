@@ -46,15 +46,15 @@ from ...utils.context_utils import Aclosing
 if TYPE_CHECKING:
   from ...agents.llm_agent import LlmAgent
 
-AF_FUNCTION_CALL_ID_PREFIX = 'adk-'
-REQUEST_EUC_FUNCTION_CALL_NAME = 'adk_request_credential'
-REQUEST_CONFIRMATION_FUNCTION_CALL_NAME = 'adk_request_confirmation'
+AF_FUNCTION_CALL_ID_PREFIX = "adk-"
+REQUEST_EUC_FUNCTION_CALL_NAME = "adk_request_credential"
+REQUEST_CONFIRMATION_FUNCTION_CALL_NAME = "adk_request_confirmation"
 
-logger = logging.getLogger('google_adk.' + __name__)
+logger = logging.getLogger("google_adk." + __name__)
 
 
 def generate_client_function_call_id() -> str:
-  return f'{AF_FUNCTION_CALL_ID_PREFIX}{uuid.uuid4()}'
+  return f"{AF_FUNCTION_CALL_ID_PREFIX}{uuid.uuid4()}"
 
 
 def populate_client_function_call_id(model_response_event: Event) -> None:
@@ -163,10 +163,10 @@ def generate_request_confirmation_event(
     request_confirmation_function_call = types.FunctionCall(
         name=REQUEST_CONFIRMATION_FUNCTION_CALL_NAME,
         args={
-            'originalFunctionCall': original_function_call.model_dump(
+            "originalFunctionCall": original_function_call.model_dump(
                 exclude_none=True, by_alias=True
             ),
-            'toolConfirmation': tool_confirmation.model_dump(
+            "toolConfirmation": tool_confirmation.model_dump(
                 by_alias=True, exclude_none=True
             ),
         },
@@ -204,6 +204,34 @@ async def handle_function_calls_async(
   )
 
 
+def _create_transfer_error_response_event(
+    invocation_context: InvocationContext,
+    function_call: types.FunctionCall,
+) -> Event:
+  """Creates an error response for a duplicate transfer_to_agent call."""
+  function_response_part = types.Part.from_function_response(
+      name=function_call.name,
+      response={
+          "error": (
+              "Error: transfer_to_agent cannot be called multiple times in "
+              "parallel. Only one transfer is allowed per turn. The first "
+              "transfer_to_agent call was executed; this call was rejected. "
+              "Please call transfer_to_agent as the only function call."
+          )
+      },
+  )
+  if function_call.id:
+    function_response_part.function_response.id = function_call.id
+
+  return Event(
+      invocation_id=invocation_context.invocation_id,
+      author=invocation_context.agent.name,
+      branch=invocation_context.branch,
+      content=types.Content(role="user", parts=[function_response_part]),
+      actions=EventActions(),
+  )
+
+
 async def handle_function_call_list_async(
     invocation_context: InvocationContext,
     function_calls: list[types.FunctionCall],
@@ -224,42 +252,63 @@ async def handle_function_call_list_async(
   if not filtered_calls:
     return None
 
-  # Create tasks for parallel execution
-  tasks = [
-      asyncio.create_task(
-          _execute_single_function_call_async(
-              invocation_context,
-              function_call,
-              tools_dict,
-              agent,
-              tool_confirmation_dict[function_call.id]
-              if tool_confirmation_dict
-              else None,
-          )
+  # Detect multiple transfer_to_agent calls and reject duplicates
+  error_response_events = []
+  transfer_calls = [
+      fc for fc in filtered_calls if fc.name == "transfer_to_agent"
+  ]
+  if len(transfer_calls) > 1:
+    duplicate_ids = {fc.id for fc in transfer_calls[1:]}
+    filtered_calls = [fc for fc in filtered_calls if fc.id not in duplicate_ids]
+    for dup in transfer_calls[1:]:
+      logger.warning(
+          "Duplicate transfer_to_agent call rejected: %s",
+          dup.args.get("agent_name") if dup.args else None,
       )
-      for function_call in filtered_calls
-  ]
+      error_response_events.append(
+          _create_transfer_error_response_event(invocation_context, dup)
+      )
 
-  # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
+  # Create tasks for parallel execution
+  function_response_events = []
+  if filtered_calls:
+    tasks = [
+        asyncio.create_task(
+            _execute_single_function_call_async(
+                invocation_context,
+                function_call,
+                tools_dict,
+                agent,
+                (
+                    tool_confirmation_dict[function_call.id]
+                    if tool_confirmation_dict
+                    else None
+                ),
+            )
+        )
+        for function_call in filtered_calls
+    ]
 
-  # Filter out None results
-  function_response_events = [
-      event for event in function_response_events if event is not None
-  ]
+    # Wait for all tasks to complete
+    function_response_events = await asyncio.gather(*tasks)
 
-  if not function_response_events:
+    # Filter out None results
+    function_response_events = [
+        event for event in function_response_events if event is not None
+    ]
+
+  all_response_events = list(function_response_events) + error_response_events
+
+  if not all_response_events:
     return None
 
-  merged_event = merge_parallel_function_response_events(
-      function_response_events
-  )
+  merged_event = merge_parallel_function_response_events(all_response_events)
 
-  if len(function_response_events) > 1:
+  if len(all_response_events) > 1:
     # this is needed for debug traces of parallel calls
     # individual response with tool.name is traced in __build_response_event
     # (we drop tool.name from span name here as this is merged event)
-    with tracer.start_as_current_span('execute_tool (merged)'):
+    with tracer.start_as_current_span("execute_tool (merged)"):
       trace_merged_tool_calls(
           response_event_id=merged_event.id,
           function_response_event=merged_event,
@@ -323,7 +372,7 @@ async def _execute_single_function_call_async(
   try:
     tool = _get_tool(function_call, tools_dict)
   except ValueError as tool_error:
-    tool = BaseTool(name=function_call.name, description='Tool not found')
+    tool = BaseTool(name=function_call.name, description="Tool not found")
     error_response = await _run_on_tool_error_callbacks(
         tool=tool,
         tool_args=function_args,
@@ -425,7 +474,7 @@ async def _execute_single_function_call_async(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
+  with tracer.start_as_current_span(f"execute_tool {tool.name}"):
     try:
       function_response_event = await _run_with_trace()
       trace_tool_call(
@@ -490,7 +539,7 @@ async def handle_function_calls_live(
     # this is needed for debug traces of parallel calls
     # individual response with tool.name is traced in __build_response_event
     # (we drop tool.name from span name here as this is merged event)
-    with tracer.start_as_current_span('execute_tool (merged)'):
+    with tracer.start_as_current_span("execute_tool (merged)"):
       trace_merged_tool_calls(
           response_event_id=merged_event.id,
           function_response_event=merged_event,
@@ -575,7 +624,7 @@ async def _execute_single_function_call_live(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
+  with tracer.start_as_current_span(f"execute_tool {tool.name}"):
     try:
       function_response_event = await _run_with_trace()
       trace_tool_call(
@@ -602,10 +651,10 @@ async def _process_function_live_helper(
   function_response = None
   # Check if this is a stop_streaming function call
   if (
-      function_call.name == 'stop_streaming'
-      and 'function_name' in function_args
+      function_call.name == "stop_streaming"
+      and "function_name" in function_args
   ):
-    function_name = function_args['function_name']
+    function_name = function_args["function_name"]
     # Thread-safe access to active_streaming_tools
     async with streaming_lock:
       active_tasks = invocation_context.active_streaming_tools
@@ -627,16 +676,16 @@ async def _process_function_live_helper(
       except (asyncio.CancelledError, asyncio.TimeoutError):
         # Log the specific condition
         if task.cancelled():
-          logging.info('Task %s was cancelled successfully', function_name)
+          logging.info("Task %s was cancelled successfully", function_name)
         elif task.done():
-          logging.info('Task %s completed during cancellation', function_name)
+          logging.info("Task %s completed during cancellation", function_name)
         else:
           logging.warning(
-              'Task %s might still be running after cancellation timeout',
+              "Task %s might still be running after cancellation timeout",
               function_name,
           )
           function_response = {
-              'status': f'The task is not cancelled yet for {function_name}.'
+              "status": f"The task is not cancelled yet for {function_name}."
           }
       if not function_response:
         # Clean up the reference under lock
@@ -648,13 +697,13 @@ async def _process_function_live_helper(
             invocation_context.active_streaming_tools[function_name].task = None
 
         function_response = {
-            'status': f'Successfully stopped streaming function {function_name}'
+            "status": f"Successfully stopped streaming function {function_name}"
         }
     else:
       function_response = {
-          'status': f'No active streaming function named {function_name} found'
+          "status": f"No active streaming function named {function_name} found"
       }
-  elif hasattr(tool, 'func') and inspect.isasyncgenfunction(tool.func):
+  elif hasattr(tool, "func") and inspect.isasyncgenfunction(tool.func):
     # for streaming tool use case
     # we require the function to be an async generator function
     async def run_tool_and_update_queue(tool, function_args, tool_context):
@@ -669,10 +718,10 @@ async def _process_function_live_helper(
         ) as agen:
           async for result in agen:
             updated_content = types.Content(
-                role='user',
+                role="user",
                 parts=[
                     types.Part.from_text(
-                        text=f'Function {tool.name} returned: {result}'
+                        text=f"Function {tool.name} returned: {result}"
                     )
                 ],
             )
@@ -699,9 +748,9 @@ async def _process_function_live_helper(
     # Immediately return a pending response.
     # This is required by current live model.
     function_response = {
-        'status': (
-            'The function is running asynchronously and the results are'
-            ' pending.'
+        "status": (
+            "The function is running asynchronously and the results are"
+            " pending."
         )
     }
   else:
@@ -720,11 +769,11 @@ def _get_tool(
     error_msg = (
         f"Tool '{function_call.name}' not found.\nAvailable tools:"
         f" {', '.join(available)}\n\nPossible causes:\n  1. LLM hallucinated"
-        ' the function name - review agent instruction clarity\n  2. Tool not'
-        ' registered - verify agent.tools list\n  3. Name mismatch - check for'
-        ' typos\n\nSuggested fixes:\n  - Review agent instruction to ensure'
-        ' tool usage is clear\n  - Verify tool is included in agent.tools'
-        ' list\n  - Check for typos in function name'
+        " the function name - review agent instruction clarity\n  2. Tool not"
+        " registered - verify agent.tools list\n  3. Name mismatch - check for"
+        " typos\n\nSuggested fixes:\n  - Review agent instruction to ensure"
+        " tool usage is clear\n  - Verify tool is included in agent.tools"
+        " list\n  - Check for typos in function name"
     )
     raise ValueError(error_msg)
 
@@ -796,7 +845,7 @@ def __build_response_event(
 ) -> Event:
   # Specs requires the result to be a dict.
   if not isinstance(function_result, dict):
-    function_result = {'result': function_result}
+    function_result = {"result": function_result}
 
   part_function_response = types.Part.from_function_response(
       name=tool.name, response=function_result
@@ -804,7 +853,7 @@ def __build_response_event(
   part_function_response.function_response.id = tool_context.function_call_id
 
   content = types.Content(
-      role='user',
+      role="user",
       parts=[part_function_response],
   )
 
@@ -830,10 +879,10 @@ def deep_merge_dicts(d1: dict, d2: dict) -> dict:
 
 
 def merge_parallel_function_response_events(
-    function_response_events: list['Event'],
-) -> 'Event':
+    function_response_events: list["Event"],
+) -> "Event":
   if not function_response_events:
-    raise ValueError('No function response events provided.')
+    raise ValueError("No function response events provided.")
 
   if len(function_response_events) == 1:
     return function_response_events[0]
@@ -863,7 +912,7 @@ def merge_parallel_function_response_events(
       invocation_id=base_event.invocation_id,
       author=base_event.author,
       branch=base_event.branch,
-      content=types.Content(role='user', parts=merged_parts),
+      content=types.Content(role="user", parts=merged_parts),
       actions=merged_actions,  # Optionally merge actions if required
   )
 

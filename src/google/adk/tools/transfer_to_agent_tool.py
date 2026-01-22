@@ -29,6 +29,11 @@ def transfer_to_agent(agent_name: str, tool_context: ToolContext) -> None:
   This tool hands off control to another agent when it's more suitable to
   answer the user's question according to the agent's description.
 
+  IMPORTANT: This tool must be called as the ONLY function call in your
+  response. Do not call transfer_to_agent multiple times or in parallel with
+  other function calls. Only one transfer is allowed per turn.
+
+
   Note:
     For most use cases, you should use TransferToAgentTool instead of this
     function directly. TransferToAgentTool provides additional enum constraints
